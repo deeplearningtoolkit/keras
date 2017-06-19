@@ -1,11 +1,13 @@
 from __future__ import absolute_import
-import six
+
 import copy
+
+import six
 from six.moves import zip
 
 from . import backend as K
-from .utils.generic_utils import serialize_keras_object
 from .utils.generic_utils import deserialize_keras_object
+from .utils.generic_utils import serialize_keras_object
 
 if K.backend() == 'tensorflow':
     import tensorflow as tf
@@ -39,6 +41,14 @@ def clip_norm(g, c, n):
         g = K.switch(K.greater_equal(n, c), g * c / n, g)
     return g
 
+# Warmup strategies
+def warmup_constant(epoch, base_lr, k, warmup_epochs):
+    lr = K.switch(K.less(epoch, warmup_epochs), base_lr, k * base_lr)
+    return lr
+
+def warmup_global(epoch, warmup_epochs, iters, delta, base_lr, k):
+    lr = K.switch(K.less(epoch, warmup_epochs), base_lr+iters*delta, base_lr*k)
+    return lr
 
 class Optimizer(object):
     """Abstract optimizer base class.
@@ -64,7 +74,7 @@ class Optimizer(object):
         self.updates = []
         self.weights = []
 
-    def get_updates(self, params, constraints, loss):
+    def get_updates(self, params, constraints, loss, iters=None):
         raise NotImplementedError
 
     def get_gradients(self, loss, params):
@@ -138,24 +148,45 @@ class SGD(Optimizer):
         nesterov: boolean. Whether to apply Nesterov momentum.
     """
 
-    def __init__(self, lr=0.01, momentum=0., decay=0.,
-                 nesterov=False, **kwargs):
+    def __init__(self, nb_batch, lr=0.01, momentum=0., decay=0.,
+                 nesterov=False, k=1.0, warmup_strategy=None, warmup_epochs=None, **kwargs):
         super(SGD, self).__init__(**kwargs)
+        self.nb_batch = K.variable(nb_batch, name='nb_batch')
+        self.k = K.variable(k, name='k')
         self.iterations = K.variable(0., name='iterations')
         self.lr = K.variable(lr, name='lr')
         self.momentum = K.variable(momentum, name='momentum')
         self.decay = K.variable(decay, name='decay')
         self.initial_decay = decay
         self.nesterov = nesterov
+        self.warmup_strategy = warmup_strategy
+        if warmup_strategy is not None:
+            self.warmup_epochs = K.variable(warmup_epochs, name='warmup_epochs')
+            if warmup_strategy == 'warmup_global':
+                self.delta = (self.k*self.lr - self.lr) / (self.warmup_epochs*self.nb_batch)
 
-    def get_updates(self, params, constraints, loss):
+    def get_updates(self, params, constraints, loss, iters=None):
         grads = self.get_gradients(loss, params)
         self.updates = []
 
         lr = self.lr
+        epoch = (self.iterations / self.nb_batch)
+        if self.warmup_strategy is not None:
+            if self.warmup_strategy == 'warmup_constant':
+                lr = warmup_constant(epoch=epoch,
+                                     base_lr=self.lr,
+                                     k=self.k,
+                                     warmup_epochs=self.warmup_epochs)
+            elif self.warmup_strategy == 'warmup_global':
+                lr = warmup_global(epoch=epoch,
+                                   warmup_epochs=self.warmup_epochs,
+                                   iters=self.iterations,
+                                   delta=self.delta,
+                                   base_lr=self.lr,
+                                   k=self.k)
+
         if self.initial_decay > 0:
             lr *= (1. / (1. + self.decay * self.iterations))
-            self.updates .append(K.update_add(self.iterations, 1))
 
         # momentum
         shapes = [K.get_variable_shape(p) for p in params]
@@ -176,7 +207,9 @@ class SGD(Optimizer):
                 new_p = c(new_p)
 
             self.updates.append(K.update(p, new_p))
-        return self.updates
+
+        self.updates.append(K.update_add(self.iterations, 1))
+        return self.updates, self.iterations, lr, self.nb_batch, self.k, epoch
 
     def get_config(self):
         config = {'lr': float(K.get_value(self.lr)),
